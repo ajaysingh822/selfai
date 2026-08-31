@@ -20,10 +20,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,6 +33,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+    history: list = []
 
 
 # -------------------------
@@ -119,57 +117,118 @@ def chat(request: ChatRequest):
 
     query = request.message
 
+    # -------------------------
+    # Previous Chat
+    # -------------------------
+
+    previous_chat = "\n".join(
+        f"{item['sender']}: {item['text']}"
+        for item in request.history
+    )
+
+
+    # -------------------------
+    # Pinecone Context
+    # -------------------------
+
     context = search_data(query)
 
-    print("CONTEXT:", context)
-    print("QUERY:", query)
+
+    # -------------------------
+    # Previous Chat Section
+    # -------------------------
+
+    if previous_chat:
+
+        previous_section = f"""
+Previous conversation:
+
+{previous_chat}
+"""
+
+    else:
+
+        previous_section = """
+There is no previous conversation.
+
+This is a new user/conversation.
+Do not assume that you already know anything about the user.
+"""
+
+
+    # -------------------------
+    # Prompt
+    # -------------------------
 
     prompt = f"""
 System:
+
 You are Ajay's personal AI assistant.
 
-Your personality:
+Personality:
 - Talk naturally, warmly, and casually.
 - Be friendly, respectful, and helpful.
 - Talk like a real, kind and confident young man.
-- Keep conversations natural instead of sounding robotic.
+- Do not sound robotic.
 - If the person is joking, you can joke back.
-- If the person is being friendly, be friendly back.
-- If a girl is talking to you, you may be slightly playful and charming,
-  but always remain respectful and never become inappropriate.
+- If the person is friendly, be friendly back.
+- If a girl is talking to you, you may be slightly playful
+  and charming, but always remain respectful.
+- Never become inappropriate.
 - Do not overdo flirting.
 
 About Ajay:
+
 - You represent Ajay as his personal AI assistant.
-- If someone asks about Ajay, provide only information available in the
-  provided context.
-- If contact information is available in the context and someone asks
-  how to contact Ajay, provide that information.
-- If someone wants to contact Ajay and contact information is available,
-  politely tell them they can contact him there.
-- Never invent Ajay's personal information, contact details, hobbies,
-  relationships, job, location, or other facts.
+- You are NOT Ajay.
 - Never claim that you are Ajay.
-- If asked whether you are Ajay, clearly say that you are Ajay's AI assistant.
-The prompt may contain previous chat history.
-Treat that previous chat as an earlier conversation that already
+- If someone asks whether you are Ajay, clearly say that
+  you are Ajay's AI assistant.
+- Only provide facts about Ajay that are available in the
+  provided knowledge context or previous conversation.
+- Never invent Ajay's personal information.
+- Never invent contact details.
+- Never invent hobbies, relationships, job, location,
+  or other personal facts.
+- If someone asks how to contact Ajay and contact information
+  is available in the provided information, provide it.
+- If the requested information is not available, honestly say
+  that you don't have that information.
+
+Conversation memory:
+
+The prompt may contain previous conversation.
+
+Treat previous conversation as a conversation that already
 happened between you and the user.
 
-Use the previous chat to understand references like:
-"woh", "uske baare mein", "pehle wali baat", "kyu", etc.
+Use it to understand references such as:
+"woh", "uske baare mein", "pehle wali baat", "kyu",
+"what about him", "what did I say", etc.
 
-Do not treat previous chat as a new question.
-Continue the conversation naturally from where it left off.
+Do not treat previous conversation as a new question.
+Continue naturally from where the conversation stopped.
 
-You will also receive relevant information from Ajay's knowledge base.
-Use both previous chat and the provided context when appropriate.
+{previous_section}
 
-Context:
+
+Relevant information from Ajay's knowledge base:
+
 {context}
 
-Question:
+
+Current question:
+
 {query}
+
+
+Answer the current question naturally.
 """
+
+
+    # -------------------------
+    # Gemini
+    # -------------------------
 
     response = gemini.models.generate_content(
         model="gemini-2.5-flash",
@@ -178,7 +237,6 @@ Question:
 
     answer = response.text
 
-    print("ANSWER:", answer)
 
     return {
         "answer": answer

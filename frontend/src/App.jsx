@@ -2,8 +2,7 @@ import { useEffect, useState } from "react"
 import "./App.css"
 
 function App() {
-
-  // Browser se purani chat directly load
+  // Browser se purani chat load
   const [messages, setMessages] = useState(() => {
     const savedMessages = localStorage.getItem("chatHistory")
 
@@ -15,21 +14,28 @@ function App() {
   })
 
   const [message, setMessage] = useState("")
+  const [loading, setLoading] = useState(false)
 
 
+  // Chat ko browser mein save karna
+  useEffect(() => {
+    localStorage.setItem(
+      "chatHistory",
+      JSON.stringify(messages)
+    )
+  }, [messages])
+
+
+  // Message send
   const sendMessage = async () => {
+    if (!message.trim() || loading) return
 
-    if (!message.trim()) return
+    const currentMessage = message.trim()
 
-    // Current message ko alag save kar rahe hain
-    const currentMessage = message
-
-    // Sirf previous chats AI ko bhejenge
     // Last 4 exchanges = 8 messages
     const previousHistory = messages.slice(-8)
 
-
-    // Screen par user message turant dikhao
+    // User message screen par show
     setMessages((prevMessages) => [
       ...prevMessages,
       {
@@ -38,15 +44,15 @@ function App() {
       }
     ])
 
-
     // Input clear
     setMessage("")
 
+    // Loading start
+    setLoading(true)
 
     try {
-
       const response = await fetch(
-        "http://127.0.0.1:8000/chat",
+        "https://selfai-0tph.onrender.com/chat",
         {
           method: "POST",
 
@@ -61,11 +67,13 @@ function App() {
         }
       )
 
+      if (!response.ok) {
+        throw new Error("Server error")
+      }
 
       const data = await response.json()
 
-
-      // AI response screen par add
+      // AI response show
       setMessages((prevMessages) => [
         ...prevMessages,
         {
@@ -73,77 +81,81 @@ function App() {
           text: data.answer
         }
       ])
+    }
 
-    } catch (error) {
-
+    catch (error) {
       console.error(error)
 
       setMessages((prevMessages) => [
         ...prevMessages,
         {
           sender: "ai",
-          text: "Sorry, I couldn't connect to the server."
+          text: "Sorry, something went wrong."
         }
       ])
     }
+
+    finally {
+      setLoading(false)
+    }
   }
-
-
-  // Messages browser mein save
-  useEffect(() => {
-
-    localStorage.setItem(
-      "chatHistory",
-      JSON.stringify(messages)
-    )
-
-  }, [messages])
 
 
   return (
     <div className="chat-container">
 
+      {/* Header */}
       <div className="chat-header">
         <h2>AJAY AI Assistant</h2>
       </div>
 
 
+      {/* Messages */}
       <div className="chat-messages">
 
         {messages.map((msg, index) => (
-
           <div
             key={index}
             className={`message ${msg.sender}`}
           >
             {msg.text}
           </div>
-
         ))}
+
+
+        {/* AI loading */}
+        {loading && (
+          <div className="message ai">
+            Thinking...
+          </div>
+        )}
 
       </div>
 
 
+      {/* Input */}
       <div className="chat-input">
 
         <input
           type="text"
           value={message}
-          onChange={(event) => setMessage(event.target.value)}
+          onChange={(event) =>
+            setMessage(event.target.value)
+          }
           placeholder="Type your message..."
 
           onKeyDown={(event) => {
-
             if (event.key === "Enter") {
               sendMessage()
             }
-
           }}
         />
 
-
-        <button onClick={sendMessage}>
-          Send
+        <button
+          onClick={sendMessage}
+          disabled={loading}
+        >
+          {loading ? "..." : "Send"}
         </button>
 
       </div>
