@@ -1,139 +1,558 @@
-import { useEffect, useState } from "react"
-import "./App.css"
+import { useEffect, useState } from "react";
+import { supabase } from "./lib/supabase";
+import "./App.css";
+
+const API_URL = import.meta.env.VITE_API_URL;
 
 function App() {
-  // Browser se purani chat load
-  const [messages, setMessages] = useState(() => {
-    const savedMessages = localStorage.getItem("chatHistory")
+  const [user, setUser] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [chatLoading, setChatLoading] = useState(false);
 
-    if (savedMessages) {
-      return JSON.parse(savedMessages)
+  // =========================================================
+  // GET CURRENT SESSION + LISTEN FOR LOGIN / LOGOUT
+  // =========================================================
+
+  useEffect(() => {
+    let mounted = true;
+
+    const getSession = async () => {
+      const {
+        data: { session },
+        error,
+      } = await supabase.auth.getSession();
+
+      if (error) {
+        console.error("Session error:", error);
+      }
+
+      if (mounted) {
+        setUser(session?.user ?? null);
+        setAuthLoading(false);
+      }
+    };
+
+    getSession();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      setAuthLoading(false);
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  // =========================================================
+  // SAVE / UPDATE USER PROFILE
+  // =========================================================
+
+  useEffect(() => {
+    if (!user) return;
+
+    const saveProfile = async () => {
+      const metadata = user.user_metadata || {};
+
+      const profile = {
+        id: user.id,
+        email: user.email || null,
+        name:
+          metadata.full_name ||
+          metadata.name ||
+          user.email?.split("@")[0] ||
+          "User",
+        avatar_url:
+          metadata.avatar_url ||
+          metadata.picture ||
+          null,
+      };
+
+      const { error } = await supabase
+        .from("profiles")
+        .upsert(profile, {
+          onConflict: "id",
+        });
+
+      if (error) {
+        console.error("Profile save error:", error);
+      }
+    };
+
+    saveProfile();
+  }, [user]);
+
+  // =========================================================
+  // LOAD USER'S CHAT FROM SUPABASE
+  // =========================================================
+
+  useEffect(() => {
+    if (!user) {
+      setMessages([]);
+      return;
     }
 
-    return []
-  })
+    const loadMessages = async () => {
+      setChatLoading(true);
 
-  const [message, setMessage] = useState("")
-  const [loading, setLoading] = useState(false)
+      const { data, error } = await supabase
+        .from("messages")
+        .select("id, role, message, created_at")
+        .eq("user_id", user.id)
+        .order("created_at", {
+          ascending: true,
+        });
 
-
-  // Chat ko browser mein save karna
-  useEffect(() => {
-    localStorage.setItem(
-      "chatHistory",
-      JSON.stringify(messages)
-    )
-  }, [messages])
-
-
-  // Message send
-  const sendMessage = async () => {
-    if (!message.trim() || loading) return
-
-    const currentMessage = message.trim()
-
-    // Last 4 exchanges = 8 messages
-    const previousHistory = messages.slice(-8)
-
-    // User message screen par show
-    setMessages((prevMessages) => [
-      ...prevMessages,
-      {
-        sender: "user",
-        text: currentMessage
+      if (error) {
+        console.error("Chat loading error:", error);
+        setChatLoading(false);
+        return;
       }
-    ])
 
-    // Input clear
-    setMessage("")
+      const formattedMessages = (data || []).map((item) => ({
+        id: item.id,
+        sender: item.role === "assistant" ? "ai" : "user",
+        text: item.message,
+        created_at: item.created_at,
+      }));
 
-    // Loading start
-    setLoading(true)
+      setMessages(formattedMessages);
+      setChatLoading(false);
+    };
+
+    loadMessages();
+  }, [user]);
+
+  // =========================================================
+  // GOOGLE LOGIN
+  // =========================================================
+
+  const signInWithGoogle = async () => {
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo: window.location.origin,
+        },
+      });
+
+      if (error) {
+        console.error("Google login error:", error);
+        alert("Unable to continue with Google.");
+      }
+    } catch (error) {
+      console.error("Google login exception:", error);
+      alert("Something went wrong.");
+    }
+  };
+
+  // =========================================================
+  // LOGOUT
+  // =========================================================
+
+  const logout = async () => {
+    const { error } = await supabase.auth.signOut();
+
+    if (error) {
+      console.error("Logout error:", error);
+      return;
+    }
+
+    setUser(null);
+    setMessages([]);
+    setMessage("");
+  };
+
+  // =========================================================
+  // SAVE MESSAGE TO SUPABASE
+  // =========================================================
+
+  const saveMessage = async (role, text) => {
+    if (!user || !text?.trim()) {
+      return null;
+    }
+
+    const { data, error } = await supabase
+      .from("messages")
+      .insert({
+        user_id: user.id,
+        role,
+        message: text.trim(),
+      })
+      .select("id, role, message, created_at")
+      .single();
+
+    if (error) {
+      console.error(`${role} message save error:`, error);
+      throw error;
+    }
+
+    return data;
+  };
+
+  // =========================================================
+  // SEND CHAT MESSAGE
+  // =========================================================
+
+  const sendMessage = async () => {
+    if (!message.trim() || loading || !user) {
+      return;
+    }
+
+    if (!API_URL) {
+      console.error("VITE_API_URL is missing.");
+      return;
+    }
+
+    const currentMessage = message.trim();
+
+    // Previous conversation for AI context
+    const previousHistory = messages.slice(-10).map((item) => ({
+      role: item.sender === "ai" ? "assistant" : "user",
+      message: item.text,
+    }));
+
+    // Clear input immediately
+    setMessage("");
+
+    // Start loading
+    setLoading(true);
+
+    // Temporary message for instant UI
+    const temporaryUserMessage = {
+      id: `temp-user-${Date.now()}`,
+      sender: "user",
+      text: currentMessage,
+    };
+
+    setMessages((prev) => [
+      ...prev,
+      temporaryUserMessage,
+    ]);
 
     try {
-      const response = await fetch(
-        "https://selfai-0tph.onrender.com/chat",
-        {
-          method: "POST",
+      // -------------------------------------------------------
+      // 1. SAVE USER MESSAGE
+      // -------------------------------------------------------
 
-          headers: {
-            "Content-Type": "application/json"
-          },
+      const savedUserMessage = await saveMessage(
+        "user",
+        currentMessage
+      );
 
-          body: JSON.stringify({
-            message: currentMessage,
-            history: previousHistory
-          })
-        }
-      )
-
-      if (!response.ok) {
-        throw new Error("Server error")
+      if (savedUserMessage) {
+        setMessages((prev) =>
+          prev.map((item) =>
+            item.id === temporaryUserMessage.id
+              ? {
+                  ...item,
+                  id: savedUserMessage.id,
+                  created_at:
+                    savedUserMessage.created_at,
+                }
+              : item
+          )
+        );
       }
 
-      const data = await response.json()
+      // -------------------------------------------------------
+      // 2. CALL BACKEND
+      // -------------------------------------------------------
 
-      // AI response show
-      setMessages((prevMessages) => [
-        ...prevMessages,
-        {
-          sender: "ai",
-          text: data.answer
+      const response = await fetch(`${API_URL}/chat`, {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json",
+        },
+
+        body: JSON.stringify({
+          message: currentMessage,
+          history: previousHistory,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `Server error: ${response.status}`
+        );
+      }
+
+      const data = await response.json();
+
+      const answer =
+        typeof data?.answer === "string"
+          ? data.answer.trim()
+          : "";
+
+      if (!answer) {
+        throw new Error("Empty AI response");
+      }
+
+      // -------------------------------------------------------
+      // 3. SHOW AI RESPONSE
+      // -------------------------------------------------------
+
+      const temporaryAIMessage = {
+        id: `temp-ai-${Date.now()}`,
+        sender: "ai",
+        text: answer,
+      };
+
+      setMessages((prev) => [
+        ...prev,
+        temporaryAIMessage,
+      ]);
+
+      // -------------------------------------------------------
+      // 4. SAVE AI RESPONSE
+      // -------------------------------------------------------
+
+      try {
+        const savedAssistantMessage = await saveMessage(
+          "assistant",
+          answer
+        );
+
+        if (savedAssistantMessage) {
+          setMessages((prev) =>
+            prev.map((item) =>
+              item.id === temporaryAIMessage.id
+                ? {
+                    ...item,
+                    id: savedAssistantMessage.id,
+                    created_at:
+                      savedAssistantMessage.created_at,
+                  }
+                : item
+            )
+          );
         }
-      ])
-    }
+      } catch (saveError) {
+        // AI response already works on screen.
+        // Only Supabase save failed.
+        console.error(
+          "AI response save failed:",
+          saveError
+        );
+      }
+    } catch (error) {
+      console.error("Chat error:", error);
 
-    catch (error) {
-      console.error(error)
-
-      setMessages((prevMessages) => [
-        ...prevMessages,
+      setMessages((prev) => [
+        ...prev,
         {
+          id: `error-${Date.now()}`,
           sender: "ai",
-          text: "Sorry, something went wrong."
-        }
-      ])
+          text:
+            "Sorry, I couldn't respond right now. Please try again.",
+        },
+      ]);
+    } finally {
+      setLoading(false);
     }
+  };
 
-    finally {
-      setLoading(false)
+  // =========================================================
+  // ENTER KEY
+  // =========================================================
+
+  const handleKeyDown = (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      sendMessage();
     }
+  };
+
+  // =========================================================
+  // AUTH LOADING
+  // =========================================================
+
+  if (authLoading) {
+    return (
+      <div className="auth-loading">
+        <div className="auth-loading-content">
+          <h2>AJAY AI</h2>
+          <p>Loading...</p>
+        </div>
+      </div>
+    );
   }
 
+  // =========================================================
+  // LOGIN PAGE
+  // =========================================================
+
+  if (!user) {
+    return (
+      <div className="login-container">
+        <div className="login-card">
+
+          <div className="login-logo">
+            AJAY AI
+          </div>
+
+          <h1>
+            Meet Ajay's
+            <br />
+            Personal AI
+          </h1>
+
+          <p className="login-description">
+            Chat naturally with Ajay's AI assistant.
+            Ask about Ajay, his work, projects,
+            education, skills and more.
+          </p>
+
+          <button
+            className="google-login-button"
+            onClick={signInWithGoogle}
+          >
+            <span className="google-icon">
+              G
+            </span>
+
+            Continue with Google
+          </button>
+
+          <p className="login-note">
+            Sign in to start chatting
+          </p>
+
+        </div>
+      </div>
+    );
+  }
+
+  // =========================================================
+  // USER INFORMATION
+  // =========================================================
+
+  const userMetadata = user.user_metadata || {};
+
+  const userName =
+    userMetadata.full_name ||
+    userMetadata.name ||
+    user.email?.split("@")[0] ||
+    "User";
+
+  const userAvatar =
+    userMetadata.avatar_url ||
+    userMetadata.picture ||
+    null;
+
+  // =========================================================
+  // CHAT PAGE
+  // =========================================================
 
   return (
     <div className="chat-container">
 
-      {/* Header */}
+      {/* HEADER */}
+
       <div className="chat-header">
-        <h2>AJAY AI Assistant</h2>
+
+        <div className="chat-header-left">
+
+          <div className="ai-avatar">
+            A
+          </div>
+
+          <div>
+            <h2>AJAY AI</h2>
+
+            <span>
+              Personal AI Assistant
+            </span>
+          </div>
+
+        </div>
+
+        <div className="chat-user">
+
+          {userAvatar ? (
+            <img
+              src={userAvatar}
+              alt="User avatar"
+              className="user-avatar"
+            />
+          ) : (
+            <div className="user-avatar fallback">
+              {userName
+                .charAt(0)
+                .toUpperCase()}
+            </div>
+          )}
+
+          <button
+            className="logout-button"
+            onClick={logout}
+          >
+            Logout
+          </button>
+
+        </div>
+
       </div>
 
+      {/* MESSAGES */}
 
-      {/* Messages */}
       <div className="chat-messages">
 
-        {messages.map((msg, index) => (
-          <div
-            key={index}
-            className={`message ${msg.sender}`}
-          >
-            {msg.text}
+        {chatLoading ? (
+          <div className="chat-status">
+            Loading your conversation...
           </div>
-        ))}
+        ) : messages.length === 0 ? (
+          <div className="welcome-message">
 
+            <div className="welcome-avatar">
+              A
+            </div>
 
-        {/* AI loading */}
+            <h3>
+              Hey {userName.split(" ")[0]} 👋
+            </h3>
+
+            <p>
+              I'm Ajay's personal AI assistant.
+              Ask me anything about Ajay,
+              his work, projects or just
+              have a conversation.
+            </p>
+
+          </div>
+        ) : (
+          messages.map((msg) => (
+            <div
+              key={msg.id}
+              className={`message ${msg.sender}`}
+            >
+              {msg.text}
+            </div>
+          ))
+        )}
+
+        {/* THINKING */}
+
         {loading && (
-          <div className="message ai">
-            Thinking...
+          <div className="message ai thinking-message">
+            <span></span>
+            <span></span>
+            <span></span>
           </div>
         )}
 
       </div>
 
+      {/* INPUT */}
 
-      {/* Input */}
       <div className="chat-input">
 
         <input
@@ -142,18 +561,17 @@ function App() {
           onChange={(event) =>
             setMessage(event.target.value)
           }
-          placeholder="Type your message..."
-
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              sendMessage()
-            }
-          }}
+          onKeyDown={handleKeyDown}
+          placeholder="Message AJAY AI..."
+          disabled={loading}
         />
 
         <button
           onClick={sendMessage}
-          disabled={loading}
+          disabled={
+            loading ||
+            !message.trim()
+          }
         >
           {loading ? "..." : "Send"}
         </button>
@@ -161,7 +579,7 @@ function App() {
       </div>
 
     </div>
-  )
+  );
 }
 
-export default App
+export default App;

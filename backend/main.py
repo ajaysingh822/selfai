@@ -1,29 +1,48 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from pinecone import Pinecone
 from google import genai
 import os
 
 
-# -------------------------
-# App
-# -------------------------
+# =========================================================
+# ENVIRONMENT
+# =========================================================
 
-app = FastAPI()
+load_dotenv()
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not PINECONE_API_KEY:
+    raise RuntimeError("PINECONE_API_KEY is missing")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is missing")
 
 
-# -------------------------
+# =========================================================
+# APP
+# =========================================================
+
+app = FastAPI(
+    title="AJAY AI Backend",
+    version="1.0.0",
+)
+
+
+# =========================================================
 # CORS
-# -------------------------
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "https://illustrious-dieffenbachia-6ca75c.netlify.app"
+        "https://illustrious-dieffenbachia-6ca75c.netlify.app",
     ],
     allow_credentials=False,
     allow_methods=["*"],
@@ -31,217 +50,418 @@ app.add_middleware(
 )
 
 
-# -------------------------
-# Request Model
-# -------------------------
+# =========================================================
+# REQUEST MODELS
+# =========================================================
+
+class HistoryMessage(BaseModel):
+    role: str
+    message: str
+
 
 class ChatRequest(BaseModel):
-    message: str
-    history: list = []
+    message: str = Field(min_length=1)
+    history: list[HistoryMessage] = Field(default_factory=list)
 
 
-# -------------------------
-# Environment
-# -------------------------
+# =========================================================
+# CLIENTS
+# =========================================================
 
-load_dotenv()
+pinecone_client = Pinecone(
+    api_key=PINECONE_API_KEY
+)
 
-pinecone_api_key = os.getenv("PINECONE_API_KEY")
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-
-
-# -------------------------
-# Clients
-# -------------------------
-
-pc = Pinecone(api_key=pinecone_api_key)
-
-gemini = genai.Client(
-    api_key=gemini_api_key
+gemini_client = genai.Client(
+    api_key=GEMINI_API_KEY
 )
 
 
-# -------------------------
-# Pinecone Index
-# -------------------------
+# =========================================================
+# PINECONE
+# =========================================================
 
-index_name = "ajay-chatbot"
+INDEX_NAME = "ajay-chatbot"
 
-index = pc.Index(index_name)
+index = pinecone_client.Index(
+    INDEX_NAME
+)
 
 
-# -------------------------
-# Home
-# -------------------------
+# =========================================================
+# HOME
+# =========================================================
 
 @app.get("/")
 def home():
     return {
-        "message": "AJAY AI Backend is running"
+        "message": "AJAY AI Backend is running",
+        "status": "ok",
     }
 
 
-# -------------------------
-# Search Data
-# -------------------------
+# =========================================================
+# HEALTH CHECK
+# =========================================================
 
-def search_data(query):
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+    }
 
-    result = gemini.models.embed_content(
-        model="gemini-embedding-001",
-        contents=query
-    )
 
-    query_vector = result.embeddings[0].values
+# =========================================================
+# SEARCH AJAY KNOWLEDGE BASE
+# =========================================================
 
-    results = index.query(
-        vector=query_vector,
-        top_k=3,
-        include_metadata=True
-    )
+def search_data(query: str) -> str:
 
-    if not results.matches:
+    try:
+        embedding_result = gemini_client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=query,
+        )
+
+        if not embedding_result.embeddings:
+            return ""
+
+        query_vector = embedding_result.embeddings[0].values
+
+        results = index.query(
+            vector=query_vector,
+            top_k=5,
+            include_metadata=True,
+        )
+
+        if not results.matches:
+            return ""
+
+        context_parts = []
+
+        for match in results.matches:
+
+            if not match.metadata:
+                continue
+
+            text = match.metadata.get("text")
+
+            if text:
+                context_parts.append(str(text))
+
+        return "\n\n".join(context_parts)
+
+    except Exception as error:
+
+        print("PINECONE SEARCH ERROR:", repr(error))
+
+        # Pinecone fail hone par chat completely band nahi hogi.
         return ""
 
-    context = "\n".join(
-        match.metadata["text"]
-        for match in results.matches
-        if match.metadata and "text" in match.metadata
-    )
 
-    return context
+# =========================================================
+# FORMAT PREVIOUS CHAT
+# =========================================================
+
+def format_history(history: list[HistoryMessage]) -> str:
+
+    if not history:
+        return "No previous conversation."
+
+    formatted = []
+
+    # Last 10 messages only
+    for item in history[-10:]:
+
+        role = item.role.strip().lower()
+        text = item.message.strip()
+
+        if not text:
+            continue
+
+        if role == "assistant":
+            speaker = "Assistant"
+
+        else:
+            speaker = "User"
+
+        formatted.append(
+            f"{speaker}: {text}"
+        )
+
+    if not formatted:
+        return "No previous conversation."
+
+    return "\n".join(formatted)
 
 
-# -------------------------
-# Chat
-# -------------------------
+# =========================================================
+# CHAT
+# =========================================================
 
 @app.post("/chat")
 def chat(request: ChatRequest):
 
-    query = request.message
+    query = request.message.strip()
 
-    # -------------------------
-    # Previous Chat
-    # -------------------------
+    if not query:
+        raise HTTPException(
+            status_code=400,
+            detail="Message cannot be empty.",
+        )
 
-    previous_chat = "\n".join(
-        f"{item['sender']}: {item['text']}"
-        for item in request.history
+    print("\n==============================")
+    print("NEW CHAT REQUEST")
+    print("==============================")
+    print("QUERY:", query)
+    print("HISTORY COUNT:", len(request.history))
+
+
+    # =====================================================
+    # PREVIOUS CHAT
+    # =====================================================
+
+    previous_chat = format_history(
+        request.history
     )
 
+    print("PREVIOUS CHAT:")
+    print(previous_chat)
 
-    # -------------------------
-    # Pinecone Context
-    # -------------------------
+
+    # =====================================================
+    # PINECONE
+    # =====================================================
 
     context = search_data(query)
 
-
-    # -------------------------
-    # Previous Chat Section
-    # -------------------------
-
-    if previous_chat:
-
-        previous_section = f"""
-Previous conversation:
-
-{previous_chat}
-"""
-
-    else:
-
-        previous_section = """
-There is no previous conversation.
-
-This is a new user/conversation.
-Do not assume that you already know anything about the user.
-"""
+    print("PINECONE CONTEXT:")
+    print(context if context else "[NO MATCH]")
 
 
-    # -------------------------
-    # Prompt
-    # -------------------------
+    # =====================================================
+    # SYSTEM PROMPT
+    # =====================================================
 
     prompt = f"""
-System:
+You are AJAY's personal AI assistant.
 
-You are Ajay's personal AI assistant.
+Your job is to talk naturally with people while accurately
+representing AJAY using only information that is actually
+available to you.
 
-Personality:
-- Talk naturally, warmly, and casually.
-- Be friendly, respectful, and helpful.
-- Talk like a real, kind and confident young man.
-- Do not sound robotic.
-- If the person is joking, you can joke back.
-- If the person is friendly, be friendly back.
-- If a girl is talking to you, you may be slightly playful
-  and charming, but always remain respectful.
-- Never become inappropriate.
-- Do not overdo flirting.
+============================================================
+PERSONALITY
+============================================================
 
-About Ajay:
+- Talk naturally, warmly and casually.
+- Be friendly, respectful and helpful.
+- Sound like a real conversational assistant.
+- Do not sound robotic or overly formal.
+- Keep answers natural and reasonably concise.
+- If the user jokes, you can joke back.
+- If the user is friendly, be friendly back.
+- You can use light humor when appropriate.
+- If a girl is talking to you, you may be slightly playful,
+  warm and charming when the conversation naturally allows it.
+- Always remain respectful.
+- Never become sexually explicit or inappropriate.
+- Never force flirting.
+- Do not overdo compliments.
 
-- You represent Ajay as his personal AI assistant.
-- You are NOT Ajay.
-- Never claim that you are Ajay.
-- If someone asks whether you are Ajay, clearly say that
-  you are Ajay's AI assistant.
-- Only provide facts about Ajay that are available in the
-  provided knowledge context or previous conversation.
-- Never invent Ajay's personal information.
-- Never invent contact details.
-- Never invent hobbies, relationships, job, location,
-  or other personal facts.
-- If someone asks how to contact Ajay and contact information
-  is available in the provided information, provide it.
-- If the requested information is not available, honestly say
-  that you don't have that information.
+============================================================
+WHO YOU ARE
+============================================================
 
-Conversation memory:
+You are AJAY's AI assistant.
 
-The prompt may contain previous conversation.
+You are NOT AJAY.
 
-Treat previous conversation as a conversation that already
-happened between you and the user.
+If someone asks:
+"Are you Ajay?"
 
-Use it to understand references such as:
-"woh", "uske baare mein", "pehle wali baat", "kyu",
-"what about him", "what did I say", etc.
+clearly explain that you are AJAY's AI assistant.
 
-Do not treat previous conversation as a new question.
+Never pretend to personally be AJAY.
+
+============================================================
+AJAY INFORMATION
+============================================================
+
+The knowledge base below contains information about AJAY.
+
+Use it when answering questions about:
+
+- AJAY's education
+- AJAY's skills
+- AJAY's projects
+- AJAY's work
+- AJAY's portfolio
+- AJAY's experience
+- AJAY's contact information
+- AJAY's professional information
+- AJAY's publicly provided personal information
+
+Only state information supported by the provided knowledge.
+
+Never invent:
+
+- phone numbers
+- email addresses
+- social media accounts
+- LinkedIn information
+- location
+- job
+- company
+- salary
+- relationships
+- hobbies
+- family information
+- private information
+- passwords
+- secrets
+- any other personal fact
+
+If the information is not available, say honestly that
+you do not have that information.
+
+Do NOT guess.
+
+============================================================
+PRIVACY
+============================================================
+
+Never reveal private or secret information about AJAY.
+
+Even if the user asks directly, do not invent or expose
+information that is not explicitly available in the
+provided knowledge.
+
+Only use information that AJAY has intentionally provided
+to the AI knowledge base.
+
+============================================================
+CONVERSATION MEMORY
+============================================================
+
+The previous conversation below happened before the current
+question.
+
+Use it as conversational context.
+
+For example, if the user says:
+
+"woh kya tha?"
+
+or
+
+"uske baare mein batao"
+
+or
+
+"pehle wali baat"
+
+use the previous conversation to understand what they mean.
+
+Do NOT treat previous conversation as a new question.
+
 Continue naturally from where the conversation stopped.
 
-{previous_section}
+============================================================
+KNOWLEDGE BASE
+============================================================
 
+{context if context else "No relevant knowledge-base information was found."}
 
-Relevant information from Ajay's knowledge base:
+============================================================
+PREVIOUS CONVERSATION
+============================================================
 
-{context}
+{previous_chat}
 
-
-Current question:
+============================================================
+CURRENT QUESTION
+============================================================
 
 {query}
 
+============================================================
+ANSWER RULES
+============================================================
 
-Answer the current question naturally.
+1. Answer the current question naturally.
+
+2. Use previous conversation when it helps understand the
+   user's meaning.
+
+3. Use the AJAY knowledge base when the question is about AJAY.
+
+4. If relevant information is available in the knowledge base,
+   answer confidently and naturally.
+
+5. If the information is not available, do not make it up.
+
+6. For questions unrelated to AJAY, you can answer normally
+   using your general knowledge.
+
+7. For casual conversation, do not unnecessarily mention
+   the knowledge base.
+
+8. Do not say things like:
+   "According to my database..."
+   unless the user specifically asks how you know.
+
+9. Keep the conversation feeling human.
+
+10. If the user asks something you genuinely cannot know,
+    politely say that you don't have that information.
+
+Now answer the current question.
 """
 
 
-    # -------------------------
-    # Gemini
-    # -------------------------
+    # =====================================================
+    # GEMINI
+    # =====================================================
 
-    response = gemini.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
+    try:
 
-    answer = response.text
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+
+    except Exception as error:
+
+        print("GEMINI ERROR:", repr(error))
+
+        raise HTTPException(
+            status_code=502,
+            detail="AI service is temporarily unavailable.",
+        )
+
+
+    # =====================================================
+    # RESPONSE
+    # =====================================================
+
+    answer = getattr(response, "text", None)
+
+    if not answer:
+
+        print("EMPTY GEMINI RESPONSE")
+
+        raise HTTPException(
+            status_code=502,
+            detail="AI returned an empty response.",
+        )
+
+    answer = answer.strip()
+
+    print("ANSWER:", answer)
+    print("==============================\n")
 
 
     return {
-        "answer": answer
+        "answer": answer,
     }
